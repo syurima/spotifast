@@ -36,89 +36,60 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
             if app.liked_walk_wanted() {
                 app.actions.push(Action::LoadMore(Page::LikedSongs));
             }
-            artist_liked_shortcut(app, ui, artist);
-            // The same overview supplies both play counts and the upcoming release.
-            app.actions
-                .push(Action::RequestPlayCounts(artist.uri.clone()));
-            // Popular.
-            theme::section_title(ui, &palette, &gettext(locale, "Popular"));
-            ui.add_space(4.0);
-            match &page.top_tracks {
-                Loadable::Loaded(tracks) if !tracks.is_empty() => {
-                    let uris: Arc<[String]> = tracks
-                        .iter()
-                        .map(|track| track.uri.clone())
-                        .collect::<Vec<_>>()
-                        .into();
-                    let context = RowContext::Uris(Arc::clone(&uris));
-                    let items: Vec<PlayableItem> =
-                        tracks.iter().cloned().map(PlayableItem::Track).collect();
-                    let limit = if page.show_all_top { items.len() } else { 5 };
-                    let show_plays = app.has_play_counts(&artist.uri);
-                    let render_top = |ui: &mut egui::Ui, app: &mut App| {
-                        for (index, item) in items.iter().take(limit).enumerate() {
-                            widgets::track_row(
-                                ui,
-                                app,
-                                TrackRow {
-                                    index,
-                                    number: Some(index + 1),
-                                    item,
-                                    context: &context,
-                                    show_cover: !app.settings.tracklist_compact,
-                                    show_album: false,
-                                    added_at: None,
-                                    added_by: None,
-                                    show_added_by: false,
-                                    show_plays,
-                                    compact: false,
-                                    thin: app.settings.tracklist_compact,
-                                    shift: 0.0,
-                                    picked: false,
-                                    picked_songs: &[],
-                                    picked_positions: &[],
-                                    position: None,
-                                },
-                            );
-                        }
-                    };
-                    if !app.network_reachable {
-                        ui.add_enabled_ui(false, |ui| {
-                            ui.multiply_opacity(0.55);
-                            render_top(ui, app);
+            let liked = artist_liked_count(app, artist);
+            if liked > 0 {
+                let liked_title = gettext(locale, "You Liked");
+                let pill = artist_liked_pill_label(locale, liked);
+                // The left section covers only its heading and pill: the
+                // Popular list beside it keeps the width its rows need,
+                // and the stacked order returns when the window is too
+                // narrow for both.
+                let left_width = crate::bidi::layout_line(
+                    ui.painter(),
+                    liked_title.as_ref(),
+                    theme::bold(17.0),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x
+                .max(theme::soft_button_width(ui, &pill) + 21.0);
+                if ui.available_width() >= left_width + 24.0 + 400.0 + 16.0 {
+                    // One row: Popular on the left, You Liked beside it,
+                    // their headings on the same top line.
+                    ui.spacing_mut().item_spacing.x = 24.0;
+                    ui.horizontal(|ui| {
+                        let popular_width =
+                            (ui.available_width() - left_width - 24.0 - 300.0).max(0.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(popular_width);
+                            artist_popular(app, ui, &page, artist, id);
                         });
-                    } else {
-                        render_top(ui, app);
-                    }
-                    if items.len() > 5 {
-                        ui.add_space(6.0);
-                        if theme::soft_button(
-                            ui,
-                            &palette,
-                            None,
-                            &if page.show_all_top {
-                                gettext(locale, "Show less")
-                            } else {
-                                gettext(locale, "See more")
-                            },
-                            false,
-                        )
-                        .clicked()
-                        {
-                            app.actions.push(Action::ToggleShowAllTop(id.to_string()));
-                        }
-                    }
+                        ui.vertical(|ui| {
+                            theme::section_title(ui, &palette, &liked_title);
+                            ui.add_space(4.0);
+                            if theme::soft_button(
+                                ui,
+                                &palette,
+                                Some(Icon::HeartFilled),
+                                &pill,
+                                false,
+                            )
+                            .clicked()
+                            {
+                                app.actions.push(Action::Open(Page::ArtistLikedSongs(
+                                    artist.id.clone(),
+                                )));
+                            }
+                        });
+                        ui.add_space(300.0);
+                    });
+                } else {
+                    artist_popular(app, ui, &page, artist, id);
+                    ui.add_space(20.0);
+                    artist_liked_shortcut(app, ui, artist);
                 }
-                Loadable::Loaded(_) => {
-                    theme::subtle(ui, &palette, &gettext(locale, "No popular songs to show."));
-                }
-                Loadable::Loading | Loadable::NotLoaded => {
-                    widgets::skeleton_rows(ui, &palette, app.locale, 5)
-                }
-                Loadable::Failed(error) => {
-                    let error = error.clone();
-                    widgets::error_row(ui, app, &error, None);
-                }
+            } else {
+                artist_popular(app, ui, &page, artist, id);
             }
             ui.add_space(20.0);
 
@@ -587,6 +558,117 @@ fn artist_actions(app: &mut App, ui: &mut egui::Ui, artist: &Artist) {
             .show(|ui| widgets::context_menu_items(ui, app, &artist.uri, &artist.name, None));
     });
     ui.add_space(20.0);
+}
+
+fn artist_liked_count(app: &App, artist: &Artist) -> usize {
+    // The count means something only once Spotify's saved tracks are in:
+    // before that a partial list undercounts and an offline one hides them.
+    if !app.saved_tracks_returned() {
+        return 0;
+    }
+    app.library
+        .liked
+        .items
+        .iter()
+        .filter(|saved| saved_track_belongs_to_artist(saved, &artist.id))
+        .count()
+}
+
+fn artist_liked_pill_label(locale: Locale, count: usize) -> String {
+    ngettext(
+        locale,
+        "{count} liked song",
+        "{count} liked songs",
+        u32::try_from(count).unwrap_or(u32::MAX),
+    )
+    .replace("{count}", &util::format_count(count as u64))
+}
+
+fn artist_popular(app: &mut App, ui: &mut egui::Ui, page: &crate::model::ArtistPage, artist: &Artist, id: &str) {
+    // The same overview supplies both play counts and the upcoming release.
+    app.actions
+        .push(Action::RequestPlayCounts(artist.uri.clone()));
+    let palette = app.palette;
+    let locale = app.locale;
+    theme::section_title(ui, &palette, &gettext(locale, "Popular"));
+    ui.add_space(4.0);
+    match &page.top_tracks {
+        Loadable::Loaded(tracks) if !tracks.is_empty() => {
+            let uris: Arc<[String]> = tracks
+                .iter()
+                .map(|track| track.uri.clone())
+                .collect::<Vec<_>>()
+                .into();
+            let context = RowContext::Uris(Arc::clone(&uris));
+            let items: Vec<PlayableItem> =
+                tracks.iter().cloned().map(PlayableItem::Track).collect();
+            let limit = if page.show_all_top { items.len() } else { 5 };
+            let show_plays = app.has_play_counts(&artist.uri);
+            let render_top = |ui: &mut egui::Ui, app: &mut App| {
+                for (index, item) in items.iter().take(limit).enumerate() {
+                    widgets::track_row(
+                        ui,
+                        app,
+                        TrackRow {
+                            index,
+                            number: Some(index + 1),
+                            item,
+                            context: &context,
+                            show_cover: !app.settings.tracklist_compact,
+                            show_album: false,
+                            added_at: None,
+                            added_by: None,
+                            show_added_by: false,
+                            show_plays,
+                            compact: false,
+                            thin: app.settings.tracklist_compact,
+                            shift: 0.0,
+                            picked: false,
+                            picked_songs: &[],
+                            picked_positions: &[],
+                            position: None,
+                        },
+                    );
+                }
+            };
+            if !app.network_reachable {
+                ui.add_enabled_ui(false, |ui| {
+                    ui.multiply_opacity(0.55);
+                    render_top(ui, app);
+                });
+            } else {
+                render_top(ui, app);
+            }
+            if items.len() > 5 {
+                ui.add_space(6.0);
+                if theme::soft_button(
+                    ui,
+                    &palette,
+                    None,
+                    &if page.show_all_top {
+                        gettext(locale, "Show less")
+                    } else {
+                        gettext(locale, "See more")
+                    },
+                    false,
+                )
+                .clicked()
+                {
+                    app.actions.push(Action::ToggleShowAllTop(id.to_string()));
+                }
+            }
+        }
+        Loadable::Loaded(_) => {
+            theme::subtle(ui, &palette, &gettext(locale, "No popular songs to show."));
+        }
+        Loadable::Loading | Loadable::NotLoaded => {
+            widgets::skeleton_rows(ui, &palette, app.locale, 5)
+        }
+        Loadable::Failed(error) => {
+            let error = error.clone();
+            widgets::error_row(ui, app, &error, None);
+        }
+    }
 }
 
 fn artist_liked_shortcut(app: &mut App, ui: &mut egui::Ui, artist: &Artist) {
