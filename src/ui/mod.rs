@@ -368,6 +368,7 @@ fn central(app: &mut App, ui: &mut egui::Ui) {
                             Page::NewReleases => new_releases::page(app, ui),
                             Page::Search => search::show(app, ui),
                             Page::LikedSongs => collection::liked(app, ui),
+                            Page::ArtistLikedSongs(id) => collection::artist_liked(app, ui, &id),
                             Page::Albums | Page::Artists | Page::Podcasts | Page::Episodes => {
                                 library::show(app, ui, page)
                             }

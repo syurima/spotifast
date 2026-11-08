@@ -58,6 +58,9 @@ const HEADLESS_SLEEP: Duration = Duration::from_secs(2);
 /// How long a playlist list Spotify turned away waits before it is asked
 /// for again.
 const PLAYLISTS_RETRY: Duration = Duration::from_secs(60);
+/// How long a saved-track page Spotify turned away waits before it is
+/// asked for again, like playlist lists.
+const LIKED_RETRY: Duration = Duration::from_secs(60);
 /// How long background work goes on before the top bar's spinner shows it,
 /// so fast answers never flash it.
 const BACKGROUND_QUIET: Duration = Duration::from_secs(1);
@@ -575,6 +578,8 @@ pub struct App {
     pub library: Library,
     liked_songs: crate::liked::LikedSongs,
     liked_recheck_at: Option<Instant>,
+    /// When a saved-track page Spotify turned away is asked for again.
+    liked_retry_at: Option<Instant>,
     pub home: HomeData,
     /// Local play history. See [`crate::history`].
     pub plays: crate::history::History,
@@ -1343,6 +1348,7 @@ impl App {
             library: Library::default(),
             liked_songs: crate::liked::LikedSongs::default(),
             liked_recheck_at: None,
+            liked_retry_at: None,
             home: HomeData::default(),
             plays,
             files: fastframe_file::Writer::new(),
@@ -3603,6 +3609,14 @@ impl App {
                     self.load_more(Page::LikedSongs);
                 }
             }
+            Page::ArtistLikedSongs(id) => {
+                if !self.liked_songs.cache_checked {
+                    self.ensure_liked_songs();
+                } else if !self.library.liked.loaded_once || self.library.liked.error.is_some() {
+                    self.library.liked.error = None;
+                    self.load_more(Page::ArtistLikedSongs(id));
+                }
+            }
             Page::Albums => {
                 if !self.library.albums.loaded_once || self.library.albums.error.is_some() {
                     self.library.albums.error = None;
@@ -3737,6 +3751,7 @@ impl App {
         };
         self.liked_songs = crate::liked::LikedSongs::default();
         self.liked_recheck_at = None;
+        self.liked_retry_at = None;
         // Friends belong to the signed-out account; an answer still on its
         // way is dropped.
         self.friends = Loadable::NotLoaded;
@@ -3820,7 +3835,10 @@ impl App {
                 || match page {
                     Page::Playlist(id) => self.playlist_pages.contains_key(id),
                     Page::Album(id) => self.album_pages.contains_key(id),
-                    Page::LikedSongs | Page::TopSongs | Page::NewReleases => true,
+                    Page::LikedSongs
+                    | Page::ArtistLikedSongs(_)
+                    | Page::TopSongs
+                    | Page::NewReleases => true,
                     _ => false,
                 }
         });
@@ -4667,6 +4685,12 @@ impl App {
                             .max(Duration::from_millis(100)),
                     );
                 }
+            }
+            if let Some(due) = self.liked_retry_at {
+                ctx.request_repaint_after(
+                    due.saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(100)),
+                );
             }
             if let Some(due) = self.queue_recheck_at {
                 if Instant::now() >= due {
@@ -6393,6 +6417,7 @@ impl App {
             }
             Page::Search => {}
             Page::LikedSongs => self.ensure_liked_songs(),
+            Page::ArtistLikedSongs(_) => self.ensure_liked_songs(),
             Page::Albums => {
                 if self.network_reachable && !self.library.albums.loaded_once {
                     self.load_more(Page::Albums);
@@ -6908,13 +6933,26 @@ impl App {
 
     pub fn load_more(&mut self, page: Page) {
         if !self.network_reachable {
-            if matches!(page, Page::LikedSongs) && !self.liked_songs.cache_checked {
+            if matches!(page, Page::LikedSongs | Page::ArtistLikedSongs(_))
+                && !self.liked_songs.cache_checked
+            {
                 self.ensure_liked_songs();
             }
             return;
         }
         match page {
             Page::LikedSongs => {
+                if !self.liked_songs.cache_checked {
+                    self.ensure_liked_songs();
+                } else if let Some(offset) = self.liked_songs.request_offset() {
+                    self.backend.api(ApiRequest::SavedTracks {
+                        offset,
+                        generation: self.liked_songs.generation,
+                    });
+                    self.library.liked.loading = true;
+                }
+            }
+            Page::ArtistLikedSongs(_) => {
                 if !self.liked_songs.cache_checked {
                     self.ensure_liked_songs();
                 } else if let Some(offset) = self.liked_songs.request_offset() {
@@ -7170,6 +7208,10 @@ impl App {
                 self.load_new_release_page(true);
             }
             Page::LikedSongs => {
+                self.refresh_liked_songs();
+                return;
+            }
+            Page::ArtistLikedSongs(_) => {
                 self.refresh_liked_songs();
                 return;
             }
@@ -9256,9 +9298,11 @@ impl App {
                             jiff::Timestamp::now().as_second(),
                         );
                     }
-                    Err(error) => self
-                        .liked_songs
-                        .fail(friendly_api_error(self.locale, &error)),
+                    Err(error) => {
+                        self.liked_retry_at = Some(Instant::now() + LIKED_RETRY);
+                        self.liked_songs
+                            .fail(friendly_api_error(self.locale, &error));
+                    }
                 }
                 if !more {
                     self.sync_liked_songs();
@@ -15090,7 +15134,16 @@ impl App {
 }
 
 impl App {
-    fn ensure_liked_songs(&mut self) {
+    #[cfg(any(test, feature = "demo"))]
+    pub(crate) fn seed_demo_liked_songs(&mut self) {
+        self.liked_songs.cache_checked = true;
+        self.liked_songs.cache_loading = false;
+        self.liked_songs.seed(&self.library.liked);
+        self.liked_songs.mark_fresh(jiff::Timestamp::now().as_second());
+        self.sync_liked_songs();
+    }
+
+    pub(crate) fn ensure_liked_songs(&mut self) {
         if self.liked_songs.cache_loading || self.liked_songs.refreshing() {
             return;
         }
@@ -15105,11 +15158,23 @@ impl App {
             self.backend.send(Command::LoadLikedSongsCache {
                 generation: self.load_generation,
             });
-        } else if !self.liked_songs.fresh(jiff::Timestamp::now().as_second())
-            && self.library.liked.error.is_none()
-            && self.network_reachable
-        {
-            self.refresh_liked_songs();
+        } else if !self.liked_songs.fresh(jiff::Timestamp::now().as_second()) {
+            if self.library.liked.error.is_none() {
+                if self.network_reachable && !self.library.liked.loading {
+                    self.refresh_liked_songs();
+                }
+            } else if self.network_reachable
+                && !self.library.liked.loading
+                && self.liked_retry_at.is_none_or(|due| Instant::now() >= due)
+            {
+                // A page Spotify turned away is asked for again after a
+                // pause, so the artist page's count and the tables recover
+                // on their own without hammering Spotify. One request per
+                // interval: the answer clears the error for now.
+                self.library.liked.error = None;
+                self.liked_retry_at = Some(Instant::now() + LIKED_RETRY);
+                self.load_more(Page::LikedSongs);
+            }
         }
     }
 
@@ -15170,6 +15235,23 @@ impl App {
     /// Whether Liked Songs at `revision` is a prefix of the rows shown now.
     pub(crate) fn liked_view_extends(&self, revision: u64) -> bool {
         self.liked_songs.view_extends(&self.library.liked, revision)
+    }
+
+    /// Whether the account's liked rows have arrived this session, straight
+    /// from /me/tracks or through the disk cache of an earlier response.
+    pub(crate) fn saved_tracks_returned(&self) -> bool {
+        self.liked_songs.saved_tracks_loaded()
+    }
+
+    /// Whether the artist page should keep the liked walk moving: a "You
+    /// Liked" count deeper in the list is not an answer until every page
+    /// has landed. A page Spotify turned away waits for the timed retry
+    /// rather than being asked again at once.
+    pub(crate) fn liked_walk_wanted(&self) -> bool {
+        self.saved_tracks_returned()
+            && self.library.liked.can_load_more()
+            && self.library.liked.error.is_none()
+            && !self.library.liked.loading
     }
 
     fn sync_liked_songs(&mut self) {
@@ -36217,6 +36299,47 @@ mod tests {
         );
         app.sync_liked_songs();
         app
+    }
+
+    #[test]
+    fn an_artist_page_walks_a_partial_list_and_errored_pages_wait() {
+        let mut app = headless_app();
+        app.liked_songs.cache_checked = true;
+        // The first page landed; Spotify has more after it.
+        app.liked_songs.absorb(
+            0,
+            crate::api::models::Page {
+                items: (0..50)
+                    .map(|n| SavedTrack {
+                        track: Track {
+                            uri: format!("spotify:track:{n}"),
+                            name: format!("Song {n}"),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .collect(),
+                total: 10_000,
+                limit: 50,
+                offset: 0,
+                next: Some("next".into()),
+            },
+            jiff::Timestamp::now().as_second(),
+        );
+        app.sync_liked_songs();
+        assert!(app.liked_walk_wanted(), "an incomplete list keeps walking");
+
+        // With a page in flight nothing new is asked for yet.
+        app.library.liked.loading = true;
+        assert!(!app.liked_walk_wanted());
+        app.library.liked.loading = false;
+
+        // A page Spotify turned away waits for its timed retry instead.
+        app.library.liked.error = Some("too many requests".into());
+        assert!(
+            !app.liked_walk_wanted(),
+            "a failed page must not bypass the retry pause"
+        );
     }
 
     #[test]

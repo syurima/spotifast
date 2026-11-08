@@ -9,7 +9,7 @@ use crate::model::{Action, DiscographyFilter, Loadable, Page, RowContext};
 use crate::theme::{self, Icon};
 use crate::util;
 
-use super::collection::{Hero, HeroArt, hero, hero_images};
+use super::collection::{Hero, HeroArt, hero, hero_images, saved_track_belongs_to_artist};
 use super::widgets::{self, TrackRow};
 
 /// Draws the artist page and keeps discography loading placeholders in place.
@@ -28,6 +28,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
         Loadable::Loaded(artist) => {
             artist_hero(app, ui, artist, preview.as_deref());
             artist_actions(app, ui, artist);
+            // The count below only sees the liked rows loaded so far, and
+            // the artist page is where the walk must otherwise grow. It
+            // shares its state with Liked Songs, so one page's progress
+            // completes the others.
+            app.ensure_liked_songs();
+            if app.liked_walk_wanted() {
+                app.actions.push(Action::LoadMore(Page::LikedSongs));
+            }
+            artist_liked_shortcut(app, ui, artist);
             // The same overview supplies both play counts and the upcoming release.
             app.actions
                 .push(Action::RequestPlayCounts(artist.uri.clone()));
@@ -577,6 +586,47 @@ fn artist_actions(app: &mut App, ui: &mut egui::Ui, artist: &Artist) {
             .frame(widgets::menu_frame(&palette))
             .show(|ui| widgets::context_menu_items(ui, app, &artist.uri, &artist.name, None));
     });
+    ui.add_space(20.0);
+}
+
+fn artist_liked_shortcut(app: &mut App, ui: &mut egui::Ui, artist: &Artist) {
+    // The count means something only once Spotify's saved tracks are in:
+    // before that a partial list undercounts and an offline one hides them.
+    if !app.saved_tracks_returned() {
+        return;
+    }
+    let count = app
+        .library
+        .liked
+        .items
+        .iter()
+        .filter(|saved| saved_track_belongs_to_artist(saved, &artist.id))
+        .count();
+    if count == 0 {
+        return;
+    }
+    let locale = app.locale;
+    let palette = app.palette;
+    theme::section_title(ui, &palette, &gettext(locale, "You Liked"));
+    ui.add_space(4.0);
+    if theme::soft_button(
+        ui,
+        &palette,
+        Some(Icon::HeartFilled),
+        &ngettext(
+            locale,
+            "{count} liked song",
+            "{count} liked songs",
+            u32::try_from(count).unwrap_or(u32::MAX),
+        )
+        .replace("{count}", &util::format_count(count as u64)),
+        false,
+    )
+    .clicked()
+    {
+        app.actions
+            .push(Action::Open(Page::ArtistLikedSongs(artist.id.clone())));
+    }
     ui.add_space(20.0);
 }
 

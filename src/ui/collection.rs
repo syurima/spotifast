@@ -329,6 +329,16 @@ pub fn actions_row(
     actions: Actions<'_>,
     filter: Option<&mut String>,
 ) {
+    actions_row_with_title(app, ui, actions, filter, None);
+}
+
+fn actions_row_with_title(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    actions: Actions<'_>,
+    filter: Option<&mut String>,
+    title: Option<&str>,
+) {
     let palette = app.palette;
     let locale = app.locale;
     ui.horizontal(|ui| {
@@ -403,6 +413,9 @@ pub fn actions_row(
                         offset_index: None,
                     });
                 }
+            }
+            if let Some(title) = title {
+                theme::text(ui, title, theme::semibold(20.0), palette.text);
             }
             let shuffle = app.playing_context_shuffle();
             if theme::icon_button(
@@ -2483,6 +2496,120 @@ fn liked_row(saved: &crate::api::models::SavedTrack) -> TableItem {
     )
 }
 
+pub(crate) fn saved_track_belongs_to_artist(
+    saved: &crate::api::models::SavedTrack,
+    artist_id: &str,
+) -> bool {
+    saved
+        .track
+        .artists
+        .iter()
+        .any(|artist| artist.id.as_deref() == Some(artist_id))
+}
+
+pub fn artist_liked(app: &mut App, ui: &mut egui::Ui, artist_id: &str) {
+    app.ensure_liked_songs();
+    let page = Page::ArtistLikedSongs(artist_id.to_string());
+    let revision = app.library.liked.revision;
+    let names = app.user_names_revision;
+    let items = if let Some(items) = table_items_hit(app, &page, revision, revision, names) {
+        items
+    } else {
+        let rows = app
+            .library
+            .liked
+            .items
+            .iter()
+            .filter(|saved| saved_track_belongs_to_artist(saved, artist_id))
+            .map(liked_row)
+            .collect();
+        remember_table_items(app, page.clone(), revision, revision, names, rows)
+    };
+    let artist_name = app
+        .artist_pages
+        .get(artist_id)
+        .and_then(|page| page.artist.get())
+        .map(|artist| artist.name.clone())
+        .or_else(|| {
+            app.known_artist(artist_id)
+                .map(|artist| artist.name.clone())
+        })
+        .unwrap_or_else(|| artist_id.to_string());
+    let title = format!("Liked Songs by {artist_name}");
+    let filter_id = egui::Id::new(("artist-liked-filter", artist_id));
+    let mut filter = ui
+        .data(|data| data.get_temp::<String>(filter_id))
+        .unwrap_or_default();
+    let needle = filter.trim().to_lowercase();
+    let sort = app.table_sorts.get(&page).copied();
+    let collection_uri = app
+        .user
+        .as_ref()
+        .map(|user| format!("spotify:user:{}:collection", user.id));
+    let table_view = prepare_table_view(
+        ui,
+        app,
+        &page,
+        &items,
+        ViewOptions {
+            needle: &needle,
+            sort,
+            plays_shown_rows: true,
+        },
+        revision,
+    );
+    let actions = Actions {
+        play_uri: collection_uri,
+        view: table_view.view_uris.as_ref().map(Arc::clone),
+        saved: None,
+        saved_icons: (Icon::Heart, Icon::HeartFilled),
+        saved_tooltips: Default::default(),
+        owned_playlist: None,
+        reload: Some((page.clone(), app.library.liked.loading)),
+        name: &title,
+        save_radio: None,
+        plays_shown_rows: true,
+    };
+    if !app.network_reachable {
+        ui.add_enabled_ui(false, |ui| {
+            actions_row_with_title(app, ui, actions, Some(&mut filter), Some(&title));
+        });
+    } else {
+        actions_row_with_title(app, ui, actions, Some(&mut filter), Some(&title));
+    }
+    ui.data_mut(|data| data.insert_temp(filter_id, filter.clone()));
+    let uris: Arc<[String]> = items
+        .iter()
+        .map(|(item, _, _)| item.uri().to_string())
+        .collect::<Vec<_>>()
+        .into();
+    let loading = app.library.liked.loading;
+    let error = app.library.liked.error.clone();
+    let can_load_more = app.library.liked.can_load_more();
+    table(
+        app,
+        ui,
+        Table {
+            items: &items,
+            row_offset: 0,
+            pagination: None,
+            context: RowContext::Uris(uris),
+            show_album: true,
+            show_cover: true,
+            show_added: true,
+            show_added_by: false,
+            show_plays: false,
+            page,
+            loading,
+            error: error.as_deref(),
+            can_load_more,
+            filter: &filter,
+            items_revision: revision,
+            plays_shown_rows: true,
+        },
+    );
+}
+
 /// A page that only adds songs after the loaded ones adds their rows to the
 /// cached rows, rather than every row being made again for each page.
 fn extend_liked_rows(app: &mut App, revision: u64, names: u64) -> Option<Arc<Vec<TableItem>>> {
@@ -2800,6 +2927,28 @@ mod tests {
 
     fn adders(ids: &[&str]) -> std::collections::BTreeSet<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn artist_liked_rows_match_collaborations_by_artist_id() {
+        let saved = crate::api::models::SavedTrack {
+            track: Track {
+                artists: vec![
+                    ArtistRef {
+                        id: Some("other".into()),
+                        ..Default::default()
+                    },
+                    ArtistRef {
+                        id: Some("target".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(saved_track_belongs_to_artist(&saved, "target"));
+        assert!(!saved_track_belongs_to_artist(&saved, "missing"));
     }
 
     #[test]

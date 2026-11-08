@@ -263,7 +263,10 @@ out, or a reconnection that gives up stops it.
   Cached pages less than 15 minutes old need no repeat request. Older cached
   prefixes refresh through the existing Web API grant, one page at a time,
   while the saved rows remain visible. Manual refresh starts immediately.
-  Like and Unlike are kept over lagging reads until Spotify confirms them.
+  A load Spotify cuts off keeps its prefix in the cache, so the next start
+  resumes from the offset instead of repeating the pages; turned-away pages
+  are asked for again a minute later. Like and Unlike are kept over lagging
+  reads until Spotify confirms them.
 - Spotifast has no telemetry, analytics, or hosted service. When the lyrics
   panel is open and neither Spotify nor a local file has lyrics, it sends
   the track's artist, title, album, and length to

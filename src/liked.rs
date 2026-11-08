@@ -274,6 +274,20 @@ impl LikedSongs {
         }
     }
 
+    /// Stamps the seed as if /me/tracks had just returned it, so the demo
+    /// passes the freshness check `ensure_liked_songs` goes by.
+    #[cfg(any(test, feature = "demo"))]
+    pub fn mark_fresh(&mut self, now: i64) {
+        self.refreshed_at = now;
+    }
+
+    /// Whether the account's saved tracks have reached this model through
+    /// Spotify: a /me/tracks page returned this session, or the disk cache
+    /// one of its earlier responses wrote.
+    pub fn saved_tracks_loaded(&self) -> bool {
+        self.server.loaded_once
+    }
+
     pub fn sync_view(&mut self, view: &mut PagedList<SavedTrack>) {
         if !self.append_to_view(view) {
             self.rebuild_view(view);
@@ -360,12 +374,18 @@ impl LikedSongs {
     }
 
     pub fn checkpoint(&mut self, account_id: String, force: bool) -> Option<Cache> {
-        if !self.server.loaded_once || self.server.error.is_some() || self.refresh.is_some() {
+        if !self.server.loaded_once || self.refresh.is_some() {
             return None;
         }
         let total = self.server.total?;
         let through = self.server.next_offset.unwrap_or(total);
-        if !force
+        // A load that failed mid-list still leaves a consistent prefix, and
+        // a session that spent its quota on it should not lose the pages
+        // when it quits. Nothing is usable before the first page lands.
+        if self.server.error.is_some() && through == 0 {
+            return None;
+        }
+        if (!force || self.server.error.is_some())
             && self.saved_through.is_some_and(|previous| {
                 through == previous
                     || (self.server.next_offset.is_some() && through.saturating_sub(previous) < 500)
@@ -531,7 +551,47 @@ mod tests {
         assert_eq!(view.items, original);
         assert!(view.error.is_some());
         assert!(!view.loading);
-        assert!(songs.checkpoint("alice".into(), true).is_none());
+        // The checkpoint that exists carries the rows that landed and the
+        // old timestamp: nothing pretends the refresh went through.
+        let cache = songs.checkpoint("alice".into(), true).unwrap();
+        assert_eq!(cache.items, original);
+        assert_eq!(cache.refreshed_at, 10_000);
+        assert!(cache.valid_for("alice"));
+    }
+
+    #[test]
+    fn a_failed_walk_checkpoints_a_resumable_prefix() {
+        let mut songs = LikedSongs {
+            cache_checked: true,
+            ..Default::default()
+        };
+        // Page 0 landed; the next page was turned away.
+        songs.absorb(0, page(0, 50, 10_000), 10_000);
+        songs.fail("too many requests".into());
+        let cache = songs.checkpoint("alice".into(), false).expect("prefix kept");
+        assert!(cache.valid_for("alice"));
+        assert_eq!(cache.next_offset, Some(50));
+
+        let mut restored = LikedSongs {
+            cache_checked: true,
+            ..Default::default()
+        };
+        restored.restore(cache);
+        assert_eq!(
+            restored.request_offset(),
+            Some(50),
+            "the walk resumes where Spotify cut off"
+        );
+    }
+
+    #[test]
+    fn a_failed_first_page_leaves_nothing_to_checkpoint() {
+        let mut songs = LikedSongs {
+            cache_checked: true,
+            ..Default::default()
+        };
+        songs.fail("too many requests".into());
+        assert!(songs.checkpoint("alice".into(), false).is_none());
     }
 
     #[test]

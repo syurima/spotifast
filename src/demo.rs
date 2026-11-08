@@ -522,6 +522,7 @@ pub fn populate(app: &mut App) {
                 .collect(),
         ),
     );
+    app.seed_demo_liked_songs();
     app.library.albums.absorb(
         0,
         page(
@@ -2041,6 +2042,14 @@ mod tests {
         // These frames never advance the clock or take pictures.
         app.reveal_theme_changes = false;
         (ctx, app)
+    }
+
+    #[test]
+    fn demo_liked_songs_are_complete_after_population() {
+        let (_, app) = accessible_app("artist-liked-complete");
+        assert!(app.library.liked.is_complete());
+        assert!(!app.library.liked.can_load_more());
+        assert!(!app.library.liked.loading);
     }
 
     /// #576: the Library heading never runs under the header's buttons. It
